@@ -1,10 +1,14 @@
 ﻿# network_switch.ps1 — GUI скрипт для управления профилями сетевого адаптера.
 
+param(
+    [string]$TargetUserSid = ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+)
+
 # === Повышение прав ===
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator
     )) {
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -TargetUserSid `"$TargetUserSid`"" -Verb RunAs
     exit
 }
 
@@ -54,6 +58,40 @@ function Test-IsNullOrWhiteSpace([object]$Value) {
     return [string]::IsNullOrWhiteSpace([string]$Value)
 }
 
+function Get-ProxyRegistryPath {
+    $relativePath = "Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+    if (-not (Test-IsNullOrWhiteSpace $TargetUserSid)) {
+        $targetPath = "Registry::HKEY_USERS\$TargetUserSid\$relativePath"
+        if (Test-Path $targetPath) {
+            return $targetPath
+        }
+    }
+
+    return "HKCU:\$relativePath"
+}
+
+function Test-IPv4Address([object]$Value) {
+    if (Test-IsNullOrWhiteSpace $Value) {
+        return $false
+    }
+
+    $parsed = [System.Net.IPAddress]::None
+    if (-not [System.Net.IPAddress]::TryParse([string]$Value, [ref]$parsed)) {
+        return $false
+    }
+
+    return $parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork
+}
+
+function Get-ConfiguredDnsServers($cfg) {
+    if (-not $cfg.ContainsKey('DNS') -or $null -eq $cfg.DNS) {
+        return @()
+    }
+
+    return @($cfg.DNS) | Where-Object { -not (Test-IsNullOrWhiteSpace $_) }
+}
+
 function Get-ProfileMode($cfg) {
     if ($cfg.ContainsKey('Mode') -and -not (Test-IsNullOrWhiteSpace $cfg.Mode)) {
         return [string]$cfg.Mode
@@ -81,8 +119,12 @@ function Format-ProfileText($cfg) {
     if ($mode -eq "Static") {
         if ($cfg.IPAddress) { $lines.Add("IP: $($cfg.IPAddress)/$($cfg.PrefixLength)") }
         if ($cfg.DefaultGateway) { $lines.Add("Шлюз: $($cfg.DefaultGateway)") }
-        if ($cfg.DNS -and $cfg.DNS.Count -gt 0) {
-            $lines.Add("DNS: $([string]::Join(', ', $cfg.DNS))")
+        $dnsServers = Get-ConfiguredDnsServers $cfg
+        if ($dnsServers.Count -gt 0) {
+            $lines.Add("DNS: $([string]::Join(', ', $dnsServers))")
+        }
+        else {
+            $lines.Add("DNS: не задавать вручную")
         }
     }
     else {
@@ -101,16 +143,6 @@ function Format-ProfileText($cfg) {
     }
 
     return ($lines -join [Environment]::NewLine)
-}
-
-function Get-PrimaryIPv4Address([string]$AdapterName) {
-    Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.IPAddress -notlike '169.254.*' -and
-        $_.PrefixOrigin -ne 'WellKnown'
-    } |
-    Sort-Object SkipAsSource, IPAddress |
-    Select-Object -First 1
 }
 
 function Get-AdapterConfig([string]$AdapterName) {
@@ -134,8 +166,9 @@ function Get-AdapterConfig([string]$AdapterName) {
             $ips += "$($ip.IPAddress)/$($ip.PrefixLength)"
         }
 
-        $proxyEnable = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue).ProxyEnable
-        $proxyServer = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue).ProxyServer
+        $proxySettings = Get-ItemProperty -Path (Get-ProxyRegistryPath) -ErrorAction SilentlyContinue
+        $proxyEnable = $proxySettings.ProxyEnable
+        $proxyServer = $proxySettings.ProxyServer
 
         $lines = New-Object System.Collections.Generic.List[string]
         $lines.Add("Адаптер: $AdapterName")
@@ -171,31 +204,102 @@ function Get-AdapterConfig([string]$AdapterName) {
     }
 }
 
+function Get-IPv4Snapshot([string]$AdapterName) {
+    $ipInterface = Get-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction Stop
+    $addresses = @(Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+        ForEach-Object {
+            [pscustomobject]@{
+                IPAddress    = $_.IPAddress
+                PrefixLength = $_.PrefixLength
+                SkipAsSource = $_.SkipAsSource
+            }
+        })
+
+    $routes = @(Get-NetRoute -InterfaceAlias $AdapterName -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            [pscustomobject]@{
+                NextHop     = $_.NextHop
+                RouteMetric = $_.RouteMetric
+            }
+        })
+
+    $dns = Get-DnsClientServerAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue
+
+    return [pscustomobject]@{
+        Dhcp          = $ipInterface.Dhcp
+        Addresses     = $addresses
+        DefaultRoutes = $routes
+        DnsServers    = @($dns.ServerAddresses)
+    }
+}
+
+function Restore-IPv4Snapshot([string]$AdapterName, $snapshot) {
+    if ($null -eq $snapshot) {
+        return
+    }
+
+    try {
+        Clear-IPv4Config $AdapterName
+
+        if ($snapshot.Dhcp -eq 'Enabled') {
+            Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+            Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses -ErrorAction Stop
+            return
+        }
+
+        Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+
+        foreach ($address in $snapshot.Addresses) {
+            $params = @{
+                InterfaceAlias = $AdapterName
+                IPAddress      = $address.IPAddress
+                PrefixLength   = [int]$address.PrefixLength
+                AddressFamily  = 'IPv4'
+                SkipAsSource   = [bool]$address.SkipAsSource
+                ErrorAction    = 'Stop'
+            }
+
+            New-NetIPAddress @params | Out-Null
+        }
+
+        foreach ($route in $snapshot.DefaultRoutes) {
+            if (-not (Test-IsNullOrWhiteSpace $route.NextHop) -and $route.NextHop -ne '0.0.0.0') {
+                New-NetRoute -InterfaceAlias $AdapterName -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop $route.NextHop -RouteMetric $route.RouteMetric -ErrorAction Stop | Out-Null
+            }
+        }
+
+        if ($snapshot.DnsServers -and $snapshot.DnsServers.Count -gt 0) {
+            Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ServerAddresses $snapshot.DnsServers -ErrorAction Stop
+        }
+        else {
+            Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses -ErrorAction Stop
+        }
+    }
+    catch {
+        throw "Не удалось восстановить прежнюю IPv4-конфигурацию: $($_.Exception.Message)"
+    }
+}
+
 function Clear-IPv4Config([string]$AdapterName) {
     $existingIPs = Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.PrefixOrigin -ne 'WellKnown' }
 
     foreach ($ip in $existingIPs) {
-        try {
-            Remove-NetIPAddress -InputObject $ip -Confirm:$false -ErrorAction SilentlyContinue
-        }
-        catch {}
+        Remove-NetIPAddress -InputObject $ip -Confirm:$false -ErrorAction Stop
     }
 
     Get-NetRoute -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } |
     ForEach-Object {
-        try {
-            Remove-NetRoute -InputObject $_ -Confirm:$false -ErrorAction SilentlyContinue
-        }
-        catch {}
+        Remove-NetRoute -InputObject $_ -Confirm:$false -ErrorAction Stop
     }
 
     Start-Sleep -Milliseconds 400
 }
 
 function Set-ProxyConfig($cfg) {
-    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    $regPath = Get-ProxyRegistryPath
 
     if ($cfg.ProxyEnabled) {
         Set-ItemProperty -Path $regPath -Name ProxyEnable -Value 1
@@ -234,10 +338,33 @@ public class WinInetRefresh {
 function Validate-ProfileConfig($cfg) {
     $mode = Get-ProfileMode $cfg
 
+    if ($mode -notin @('Static', 'DHCP')) {
+        throw "В профиле '$($cfg.Name)' указан неизвестный режим '$mode'. Допустимо: Static или DHCP."
+    }
+
     if ($mode -eq 'Static') {
         foreach ($required in @('IPAddress', 'PrefixLength')) {
             if (-not $cfg.ContainsKey($required) -or (Test-IsNullOrWhiteSpace $cfg[$required])) {
                 throw "В профиле '$($cfg.Name)' отсутствует обязательный параметр '$required'."
+            }
+        }
+
+        if (-not (Test-IPv4Address $cfg.IPAddress)) {
+            throw "В профиле '$($cfg.Name)' указан некорректный IPv4-адрес '$($cfg.IPAddress)'."
+        }
+
+        $prefixLength = 0
+        if (-not [int]::TryParse([string]$cfg.PrefixLength, [ref]$prefixLength) -or $prefixLength -lt 0 -or $prefixLength -gt 32) {
+            throw "В профиле '$($cfg.Name)' указан некорректный PrefixLength '$($cfg.PrefixLength)'. Допустимо: 0..32."
+        }
+
+        if (-not (Test-IsNullOrWhiteSpace $cfg.DefaultGateway) -and -not (Test-IPv4Address $cfg.DefaultGateway)) {
+            throw "В профиле '$($cfg.Name)' указан некорректный шлюз '$($cfg.DefaultGateway)'."
+        }
+
+        foreach ($dnsServer in (Get-ConfiguredDnsServers $cfg)) {
+            if (-not (Test-IPv4Address $dnsServer)) {
+                throw "В профиле '$($cfg.Name)' указан некорректный DNS-сервер '$dnsServer'."
             }
         }
     }
@@ -248,6 +375,9 @@ function Validate-ProfileConfig($cfg) {
 }
 
 function Apply-Config([string]$AdapterName, $cfg, $onDone) {
+    $snapshot = $null
+    $configChanged = $false
+
     try {
         if (Test-IsNullOrWhiteSpace $AdapterName) {
             throw "Не выбран сетевой адаптер."
@@ -255,11 +385,13 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
 
         Validate-ProfileConfig $cfg
         $mode = Get-ProfileMode $cfg
+        $snapshot = Get-IPv4Snapshot $AdapterName
 
         Clear-IPv4Config $AdapterName
+        $configChanged = $true
 
         if ($mode -eq 'Static') {
-            Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
+            Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
 
             $newIpParams = @{
                 InterfaceAlias = $AdapterName
@@ -275,8 +407,9 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
 
             New-NetIPAddress @newIpParams | Out-Null
 
-            if ($cfg.DNS -and $cfg.DNS.Count -gt 0) {
-                Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ServerAddresses $cfg.DNS -ErrorAction Stop
+            $dnsServers = Get-ConfiguredDnsServers $cfg
+            if ($dnsServers.Count -gt 0) {
+                Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ServerAddresses $dnsServers -ErrorAction Stop
             }
             else {
                 Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses -ErrorAction Stop
@@ -287,7 +420,10 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
             Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses -ErrorAction Stop
 
             Start-Sleep -Seconds 1
-            ipconfig /renew | Out-Null
+            $renewOutput = ipconfig /renew "$AdapterName" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Не удалось обновить DHCP-аренду для адаптера '$AdapterName': $renewOutput"
+            }
         }
 
         Set-ProxyConfig $cfg
@@ -295,7 +431,19 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
         & $onDone $true "Профиль '$($cfg.Name)' применён."
     }
     catch {
-        & $onDone $false "Ошибка при применении профиля '$($cfg.Name)': $($_.Exception.Message)"
+        $errorMessage = $_.Exception.Message
+
+        if ($configChanged -and $null -ne $snapshot) {
+            try {
+                Restore-IPv4Snapshot $AdapterName $snapshot
+                $errorMessage = "$errorMessage`n`nПрежняя IPv4-конфигурация восстановлена."
+            }
+            catch {
+                $errorMessage = "$errorMessage`n`n$($_.Exception.Message)"
+            }
+        }
+
+        & $onDone $false "Ошибка при применении профиля '$($cfg.Name)': $errorMessage"
     }
 }
 
@@ -435,7 +583,18 @@ function Add-ProfileButtons {
                 }
 
                 $key = [string]$this.Tag
-                Apply-Config ([string]$cbAdapter.SelectedItem) $NetworkConfigs[$key] $onApplied
+                $window.Cursor = [System.Windows.Input.Cursors]::Wait
+                $profilesPanel.IsEnabled = $false
+                $btnRefresh.IsEnabled = $false
+
+                try {
+                    Apply-Config ([string]$cbAdapter.SelectedItem) $NetworkConfigs[$key] $onApplied
+                }
+                finally {
+                    $profilesPanel.IsEnabled = $true
+                    $btnRefresh.IsEnabled = $true
+                    $window.Cursor = $null
+                }
             })
 
         [void]$profilesPanel.Children.Add($btn)
