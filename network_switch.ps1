@@ -246,6 +246,31 @@ function Get-IPv4Snapshot([string]$AdapterName) {
     }
 }
 
+function Set-InterfaceDhcpState([string]$AdapterName, [string]$DhcpState) {
+    # DHCP нужно переключать в обоих хранилищах: Set-NetIPInterface по умолчанию меняет
+    # только ActiveStore, а New-NetIPAddress пишет и в PersistentStore — если там DHCP
+    # остаётся включенным, возникает ошибка "Inconsistent parameters PolicyStore
+    # PersistentStore and Dhcp Enabled".
+    Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp $DhcpState -PolicyStore ActiveStore -ErrorAction Stop
+    Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp $DhcpState -PolicyStore PersistentStore -ErrorAction Stop
+}
+
+function New-IPv4AddressWithRetry($params) {
+    # Смена DHCP-состояния применяется не мгновенно — даём стеку время и повторяем.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            New-NetIPAddress @params | Out-Null
+            return
+        }
+        catch {
+            if ($attempt -eq 3) {
+                throw
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
 function Restore-IPv4Snapshot([string]$AdapterName, $snapshot) {
     if ($null -eq $snapshot) {
         return
@@ -255,12 +280,12 @@ function Restore-IPv4Snapshot([string]$AdapterName, $snapshot) {
         Clear-IPv4Config $AdapterName
 
         if ($snapshot.Dhcp -eq 'Enabled') {
-            Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+            Set-InterfaceDhcpState $AdapterName 'Enabled'
             Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses -ErrorAction Stop
             return
         }
 
-        Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+        Set-InterfaceDhcpState $AdapterName 'Disabled'
 
         foreach ($address in $snapshot.Addresses) {
             $params = @{
@@ -272,7 +297,7 @@ function Restore-IPv4Snapshot([string]$AdapterName, $snapshot) {
                 ErrorAction    = 'Stop'
             }
 
-            New-NetIPAddress @params | Out-Null
+            New-IPv4AddressWithRetry $params
         }
 
         foreach ($route in $snapshot.DefaultRoutes) {
@@ -395,6 +420,15 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
             throw "Не выбран сетевой адаптер."
         }
 
+        $adapter = Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue
+        if ($null -eq $adapter) {
+            throw "Адаптер '$AdapterName' не найден."
+        }
+
+        if ($adapter.Status -ne 'Up') {
+            throw "Адаптер '$AdapterName' не подключен (статус: $($adapter.Status)). Подключитесь к сети и повторите попытку."
+        }
+
         Validate-ProfileConfig $cfg
         $mode = Get-ProfileMode $cfg
         $snapshot = Get-IPv4Snapshot $AdapterName
@@ -403,7 +437,7 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
         $configChanged = $true
 
         if ($mode -eq 'Static') {
-            Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+            Set-InterfaceDhcpState $AdapterName 'Disabled'
 
             $newIpParams = @{
                 InterfaceAlias = $AdapterName
@@ -417,7 +451,7 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
                 $newIpParams['DefaultGateway'] = $cfg.DefaultGateway
             }
 
-            New-NetIPAddress @newIpParams | Out-Null
+            New-IPv4AddressWithRetry $newIpParams
 
             $dnsServers = Get-ConfiguredDnsServers $cfg
             if ($dnsServers.Count -gt 0) {
@@ -428,7 +462,7 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
             }
         }
         else {
-            Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+            Set-InterfaceDhcpState $AdapterName 'Enabled'
             Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses -ErrorAction Stop
 
             Start-Sleep -Seconds 1
