@@ -50,6 +50,18 @@ $NetworkConfigs = [ordered]@{
     }
 }
 
+# Дефолты для диалога ручного ввода (обновляются после каждого ввода в рамках сеанса)
+$script:ManualDefaults = @{
+    Mode           = "Static"   # Static | DHCP
+    IPAddress      = "192.168.1.10"
+    PrefixLength   = "24"
+    DefaultGateway = "192.168.1.1"
+    DNS            = "8.8.8.8, 8.8.4.4"
+    ProxyEnabled   = $true
+    ProxyServer    = "192.168.1.1:3128"
+    ProxyOverride  = "<local>"
+}
+
 # ==================================
 # === Вспомогательные функции ======
 # ==================================
@@ -447,6 +459,157 @@ function Apply-Config([string]$AdapterName, $cfg, $onDone) {
     }
 }
 
+function Show-ManualConfigDialog($ownerWindow) {
+    [xml]$dlgXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="Ручной ввод параметров"
+        Width="440" SizeToContent="Height"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner">
+  <Grid Margin="12">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+      <TextBlock Text="Режим:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,12,0"/>
+      <RadioButton Name="RbStatic" Content="Static" GroupName="Mode" VerticalAlignment="Center" Margin="0,0,12,0"/>
+      <RadioButton Name="RbDhcp" Content="DHCP" GroupName="Mode" VerticalAlignment="Center"/>
+    </StackPanel>
+
+    <GroupBox Header="Параметры IP" Grid.Row="1" Margin="0,0,0,10"
+              IsEnabled="{Binding IsChecked, ElementName=RbStatic}">
+      <Grid Margin="8">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="150"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="IP-адрес:" VerticalAlignment="Center" Margin="0,0,8,6"/>
+        <TextBox Name="TxtIp" Grid.Column="1" Height="24" Margin="0,0,0,6"/>
+
+        <TextBlock Text="Длина префикса (0-32):" Grid.Row="1" VerticalAlignment="Center" Margin="0,0,8,6"/>
+        <TextBox Name="TxtPrefix" Grid.Row="1" Grid.Column="1" Height="24" Margin="0,0,0,6"/>
+
+        <TextBlock Text="Шлюз:" Grid.Row="2" VerticalAlignment="Center" Margin="0,0,8,6"/>
+        <TextBox Name="TxtGateway" Grid.Row="2" Grid.Column="1" Height="24" Margin="0,0,0,6"/>
+
+        <TextBlock Text="DNS (через запятую):" Grid.Row="3" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBox Name="TxtDns" Grid.Row="3" Grid.Column="1" Height="24"/>
+      </Grid>
+    </GroupBox>
+
+    <GroupBox Header="Прокси" Grid.Row="2" Margin="0,0,0,10">
+      <Grid Margin="8">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="150"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <CheckBox Name="ChkProxy" Content="Использовать прокси" Grid.ColumnSpan="2" Margin="0,0,0,6"/>
+
+        <TextBlock Text="Сервер (адрес:порт):" Grid.Row="1" VerticalAlignment="Center" Margin="0,0,8,6"/>
+        <TextBox Name="TxtProxyServer" Grid.Row="1" Grid.Column="1" Height="24" Margin="0,0,0,6"
+                 IsEnabled="{Binding IsChecked, ElementName=ChkProxy}"/>
+
+        <TextBlock Text="Исключения:" Grid.Row="2" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBox Name="TxtProxyOverride" Grid.Row="2" Grid.Column="1" Height="24"
+                 IsEnabled="{Binding IsChecked, ElementName=ChkProxy}"/>
+      </Grid>
+    </GroupBox>
+
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button Name="BtnOk" Content="Применить" Width="110" Height="28" Margin="0,0,8,0" IsDefault="True"/>
+      <Button Name="BtnCancel" Content="Отмена" Width="110" Height="28" IsCancel="True"/>
+    </StackPanel>
+  </Grid>
+</Window>
+"@
+
+    $dlgReader = New-Object System.Xml.XmlNodeReader $dlgXaml
+    $dlg = [Windows.Markup.XamlReader]::Load($dlgReader)
+    $dlg.Owner = $ownerWindow
+
+    $rbStatic = $dlg.FindName('RbStatic')
+    $rbDhcp = $dlg.FindName('RbDhcp')
+    $txtIp = $dlg.FindName('TxtIp')
+    $txtPrefix = $dlg.FindName('TxtPrefix')
+    $txtGateway = $dlg.FindName('TxtGateway')
+    $txtDns = $dlg.FindName('TxtDns')
+    $chkProxy = $dlg.FindName('ChkProxy')
+    $txtProxyServer = $dlg.FindName('TxtProxyServer')
+    $txtProxyOverride = $dlg.FindName('TxtProxyOverride')
+    $btnOk = $dlg.FindName('BtnOk')
+
+    # Предзаполнение дефолтами
+    $defaults = $script:ManualDefaults
+    if ($defaults.Mode -eq 'DHCP') { $rbDhcp.IsChecked = $true } else { $rbStatic.IsChecked = $true }
+    $txtIp.Text = [string]$defaults.IPAddress
+    $txtPrefix.Text = [string]$defaults.PrefixLength
+    $txtGateway.Text = [string]$defaults.DefaultGateway
+    $txtDns.Text = [string]$defaults.DNS
+    $chkProxy.IsChecked = [bool]$defaults.ProxyEnabled
+    $txtProxyServer.Text = [string]$defaults.ProxyServer
+    $txtProxyOverride.Text = [string]$defaults.ProxyOverride
+
+    # Через Tag, чтобы не зависеть от области видимости в обработчике
+    $btnOk.Tag = $dlg
+    $btnOk.Add_Click({ $this.Tag.DialogResult = $true })
+
+    if (-not $dlg.ShowDialog()) {
+        return $null
+    }
+
+    $mode = if ($rbDhcp.IsChecked) { 'DHCP' } else { 'Static' }
+
+    # Запоминаем введённое как новые дефолты (в рамках сеанса)
+    $script:ManualDefaults = @{
+        Mode           = $mode
+        IPAddress      = $txtIp.Text.Trim()
+        PrefixLength   = $txtPrefix.Text.Trim()
+        DefaultGateway = $txtGateway.Text.Trim()
+        DNS            = $txtDns.Text.Trim()
+        ProxyEnabled   = [bool]$chkProxy.IsChecked
+        ProxyServer    = $txtProxyServer.Text.Trim()
+        ProxyOverride  = $txtProxyOverride.Text.Trim()
+    }
+
+    $cfg = @{
+        Name         = "Ручной ввод"
+        Mode         = $mode
+        ProxyEnabled = [bool]$chkProxy.IsChecked
+        Description  = "Параметры, введённые вручную"
+    }
+
+    if ($mode -eq 'Static') {
+        $cfg.IPAddress = $txtIp.Text.Trim()
+        $cfg.PrefixLength = $txtPrefix.Text.Trim()
+        $cfg.DefaultGateway = $txtGateway.Text.Trim()
+        $cfg.DNS = @($txtDns.Text -split '[,;\s]+' | Where-Object { -not (Test-IsNullOrWhiteSpace $_) })
+    }
+
+    if ($cfg.ProxyEnabled) {
+        $cfg.ProxyServer = $txtProxyServer.Text.Trim()
+        $cfg.ProxyOverride = $txtProxyOverride.Text.Trim()
+    }
+
+    return $cfg
+}
+
 # =====================
 # === XAML интерфейс ===
 # =====================
@@ -599,6 +762,43 @@ function Add-ProfileButtons {
 
         [void]$profilesPanel.Children.Add($btn)
     }
+
+    # Кнопка ручного ввода параметров
+    $btnManual = New-Object System.Windows.Controls.Button
+    $btnManual.Content = "Ручной ввод…"
+    $btnManual.Width = 130
+    $btnManual.Height = 38
+    $btnManual.Margin = '4'
+    $btnManual.ToolTip = "Ввод сетевых параметров вручную (поля предзаполнены значениями по умолчанию)"
+
+    $btnManual.Add_Click({
+            if ($null -eq $cbAdapter.SelectedItem) {
+                [System.Windows.MessageBox]::Show("Сначала выберите сетевой адаптер.", "Внимание") | Out-Null
+                return
+            }
+
+            $cfg = Show-ManualConfigDialog $window
+            if ($null -eq $cfg) {
+                return
+            }
+
+            $txtProfile.Text = Format-ProfileText $cfg
+
+            $window.Cursor = [System.Windows.Input.Cursors]::Wait
+            $profilesPanel.IsEnabled = $false
+            $btnRefresh.IsEnabled = $false
+
+            try {
+                Apply-Config ([string]$cbAdapter.SelectedItem) $cfg $onApplied
+            }
+            finally {
+                $profilesPanel.IsEnabled = $true
+                $btnRefresh.IsEnabled = $true
+                $window.Cursor = $null
+            }
+        })
+
+    [void]$profilesPanel.Children.Add($btnManual)
 }
 
 # ==========================
